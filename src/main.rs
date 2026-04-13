@@ -10,9 +10,10 @@ use colored::Colorize;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use cli::{Cli, Commands, CrawlArgs, SearchArgs, SourcesCmd};
+use cli::{Cli, Commands, CrawlArgs, SearchArgs, SourcesCmd, UpdateArgs};
 use crawler::{build_client, create_crawler, search_crawlers};
 use models::{Chapter, Novel};
 use output::{build_filename, write_outputs};
@@ -48,6 +49,7 @@ async fn run() -> Result<()> {
         Some(Commands::Sources(sub)) => run_sources(sub),
         Some(Commands::Crawl(args)) => run_crawl(args).await,
         Some(Commands::Search(args)) => run_search(args).await,
+        Some(Commands::Update(args)) => run_update(args).await,
     }
 }
 
@@ -178,7 +180,7 @@ async fn run_crawl(mut args: CrawlArgs) -> Result<()> {
     // 4. Resolve output dir early so we can check what's already downloaded.
     let out_dir = resolve_output_dir(&novel, &args)?;
     let already_downloaded = if out_dir.exists() {
-        load_downloaded_ids(&out_dir)
+        load_downloaded_urls(&out_dir)
     } else {
         std::collections::HashSet::new()
     };
@@ -186,7 +188,7 @@ async fn run_crawl(mut args: CrawlArgs) -> Result<()> {
     let current_downloaded_count = novel
         .chapters
         .iter()
-        .filter(|ch| already_downloaded.contains(&ch.id))
+        .filter(|ch| already_downloaded.contains(&ch.url))
         .count();
 
     // Print download status below novel info.
@@ -210,7 +212,7 @@ async fn run_crawl(mut args: CrawlArgs) -> Result<()> {
         // CLI-specified: honour the range but skip already downloaded
         let all = args.select_indices(novel.chapters.len());
         all.into_iter()
-            .filter(|&i| !already_downloaded.contains(&novel.chapters[i].id))
+            .filter(|&i| !already_downloaded.contains(&novel.chapters[i].url))
             .collect::<Vec<_>>()
     } else {
         prompt_chapter_selection(&novel, &already_downloaded)?
@@ -245,6 +247,7 @@ async fn run_crawl(mut args: CrawlArgs) -> Result<()> {
     let max_workers = args.workers.max(1).min(20);
     let novel_arc = Arc::new(tokio::sync::Mutex::new(novel.clone()));
     let crawler_arc = Arc::new(crawler);
+    let abort = Arc::new(AtomicBool::new(false));
 
     futures::stream::iter(indices.clone())
         .map(|idx| {
@@ -252,7 +255,12 @@ async fn run_crawl(mut args: CrawlArgs) -> Result<()> {
             let pb = pb.clone();
             let novel_arc = Arc::clone(&novel_arc);
             let crawler = Arc::clone(&crawler_arc);
+            let abort = Arc::clone(&abort);
             async move {
+                if abort.load(Ordering::Relaxed) {
+                    pb.inc(1);
+                    return;
+                }
                 let chapter = {
                     let n = novel_arc.lock().await;
                     n.chapters[idx].clone()
@@ -265,12 +273,21 @@ async fn run_crawl(mut args: CrawlArgs) -> Result<()> {
                         n.chapters[idx] = chapter;
                     }
                     Err(e) => {
-                        pb.println(format!(
-                            "{} chapter {}: {}",
-                            "warn:".yellow(),
-                            idx + 1,
-                            e
-                        ));
+                        let msg = e.to_string();
+                        if msg.contains("did not return JSON") {
+                            abort.store(true, Ordering::Relaxed);
+                            pb.println(format!(
+                                "{} Non-JSON response from server — stopping chapter downloads.",
+                                "error:".red().bold()
+                            ));
+                        } else {
+                            pb.println(format!(
+                                "{} chapter {}: {}",
+                                "warn:".yellow(),
+                                idx + 1,
+                                e
+                            ));
+                        }
                     }
                 }
                 pb.inc(1);
@@ -322,6 +339,8 @@ async fn run_crawl(mut args: CrawlArgs) -> Result<()> {
     // 9. Write output files
     let formats = if !args.format.is_empty() || args.suppress {
         args.resolved_formats()
+    } else if let Some(detected) = detect_existing_formats(&out_dir) {
+        detected
     } else {
         prompt_format_selection()?
     };
@@ -339,11 +358,11 @@ async fn run_crawl(mut args: CrawlArgs) -> Result<()> {
 
 fn prompt_chapter_selection(
     novel: &Novel,
-    already_downloaded: &std::collections::HashSet<usize>,
+    already_downloaded: &std::collections::HashSet<String>,
 ) -> Result<Vec<usize>> {
     let total = novel.chapters.len();
     let missing: Vec<usize> = (0..total)
-        .filter(|&i| !already_downloaded.contains(&novel.chapters[i].id))
+        .filter(|&i| !already_downloaded.contains(&novel.chapters[i].url))
         .collect();
     let choices = vec![
         format!(
@@ -371,7 +390,7 @@ fn prompt_chapter_selection(
                 .default(10usize)
                 .interact_text()?;
             Ok((0..n.min(total))
-                .filter(|&i| !already_downloaded.contains(&novel.chapters[i].id))
+                .filter(|&i| !already_downloaded.contains(&novel.chapters[i].url))
                 .collect())
         }
         3 => {
@@ -381,7 +400,7 @@ fn prompt_chapter_selection(
                 .interact_text()?;
             let start = total.saturating_sub(n);
             Ok((start..total)
-                .filter(|&i| !already_downloaded.contains(&novel.chapters[i].id))
+                .filter(|&i| !already_downloaded.contains(&novel.chapters[i].url))
                 .collect())
         }
         4 => {
@@ -394,10 +413,35 @@ fn prompt_chapter_selection(
                 .default(total)
                 .interact_text()?;
             Ok((from.saturating_sub(1)..to.min(total))
-                .filter(|&i| !already_downloaded.contains(&novel.chapters[i].id))
+                .filter(|&i| !already_downloaded.contains(&novel.chapters[i].url))
                 .collect())
         }
         _ => Ok(missing),
+    }
+}
+
+/// If `out_dir` contains files of exactly one known format type (json/epub/txt),
+/// return that format automatically so the user isn't prompted again.
+fn detect_existing_formats(out_dir: &std::path::Path) -> Option<Vec<models::OutputFormat>> {
+    use models::OutputFormat;
+    if !out_dir.exists() {
+        return None;
+    }
+    let mut found: std::collections::HashSet<OutputFormat> = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(out_dir) {
+        for entry in entries.flatten() {
+            match entry.path().extension().and_then(|e| e.to_str()) {
+                Some("json") => { found.insert(OutputFormat::Json); }
+                Some("epub") => { found.insert(OutputFormat::Epub); }
+                Some("txt")  => { found.insert(OutputFormat::Txt); }
+                _ => {}
+            }
+        }
+    }
+    if found.len() == 1 {
+        Some(found.into_iter().collect())
+    } else {
+        None
     }
 }
 
@@ -441,15 +485,15 @@ fn print_novel_info(novel: &Novel) {
     println!("{}\n", "═".repeat(60));
 }
 
-/// Return the set of chapter IDs that have already been downloaded (body present)
+/// Return the set of chapter URLs that have already been downloaded (body present)
 /// by reading any .json file found in `out_dir`.
-fn load_downloaded_ids(out_dir: &std::path::Path) -> std::collections::HashSet<usize> {
+fn load_downloaded_urls(out_dir: &std::path::Path) -> std::collections::HashSet<String> {
     load_existing_novel(out_dir)
         .map(|n| {
             n.chapters
                 .into_iter()
                 .filter(|c| c.body.is_some())
-                .map(|c| c.id)
+                .map(|c| c.url.clone())
                 .collect()
         })
         .unwrap_or_default()
@@ -484,6 +528,257 @@ fn resolve_output_dir(novel: &Novel, args: &CrawlArgs) -> Result<PathBuf> {    i
         .collect();
     let safe = safe.trim().replace(' ', "_");
     Ok(PathBuf::from("Lightnovels").join(safe))
+}
+
+// ── update ─────────────────────────────────────────────────────────────────────
+
+async fn run_update(args: UpdateArgs) -> Result<()> {
+    let base_dir = args.output.clone().unwrap_or_else(|| PathBuf::from("Lightnovels"));
+    if !base_dir.exists() {
+        bail!(
+            "Directory '{}' does not exist. Nothing to update.",
+            base_dir.display()
+        );
+    }
+
+    // Discover novel directories that contain a .json file
+    let mut novels_to_update: Vec<(PathBuf, Novel)> = Vec::new();
+    for entry in std::fs::read_dir(&base_dir)?.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Some(novel) = load_existing_novel(&dir) {
+            if novel.url.is_empty() {
+                continue;
+            }
+            // Apply optional filter
+            if let Some(ref filter) = args.filter {
+                let filter_lower = filter.to_lowercase();
+                let dir_name = dir
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                if !dir_name.contains(&filter_lower)
+                    && !novel.title.to_lowercase().contains(&filter_lower)
+                {
+                    continue;
+                }
+            }
+            novels_to_update.push((dir, novel));
+        }
+    }
+
+    if novels_to_update.is_empty() {
+        println!("{}", "No novels found to update.".yellow());
+        return Ok(());
+    }
+
+    println!(
+        "{} Found {} novel(s) to check for updates.\n",
+        "→".cyan(),
+        novels_to_update.len()
+    );
+
+    let client = Arc::new(build_client()?);
+
+    for (out_dir, existing_novel) in &novels_to_update {
+        println!(
+            "{} Checking: {}",
+            "→".cyan(),
+            existing_novel.title.bold().white()
+        );
+
+        // Find crawler for this novel's URL
+        let crawler = match create_crawler(&existing_novel.url) {
+            Some(c) => c,
+            None => {
+                eprintln!(
+                    "  {} No crawler for {}",
+                    "skip:".yellow(),
+                    existing_novel.url,
+                );
+                continue;
+            }
+        };
+
+        // Fetch fresh chapter list
+        let fresh_novel = match crawler.read_novel_info(&client, &existing_novel.url).await {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!(
+                    "  {} Failed to fetch info: {}",
+                    "warn:".yellow(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        // Determine which chapters are new
+        let existing_urls: std::collections::HashSet<String> = existing_novel
+            .chapters
+            .iter()
+            .filter(|c| c.body.is_some())
+            .map(|c| c.url.clone())
+            .collect();
+
+        let new_indices: Vec<usize> = fresh_novel
+            .chapters
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !existing_urls.contains(&c.url))
+            .map(|(i, _)| i)
+            .collect();
+
+        if new_indices.is_empty() {
+            println!(
+                "  {} Up to date ({} chapters)",
+                "✓".green(),
+                existing_novel.chapters.len()
+            );
+            continue;
+        }
+
+        println!(
+            "  {} {} new chapter(s) found (had {}, now {})",
+            "↓".green(),
+            new_indices.len(),
+            existing_novel.chapters.len(),
+            fresh_novel.chapters.len()
+        );
+
+        // Download new chapters
+        let pb = ProgressBar::new(new_indices.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "  {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}",
+                )
+                .unwrap()
+                .progress_chars("##-"),
+        );
+
+        let max_workers = args.workers.max(1).min(20);
+        let novel_arc: Arc<tokio::sync::Mutex<Novel>> = Arc::new(tokio::sync::Mutex::new(fresh_novel.clone()));
+        let crawler_arc: Arc<Box<dyn crawler::Crawler>> = Arc::new(crawler);
+        let abort: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+        futures::stream::iter(new_indices.clone())
+            .map(|idx| {
+                let client = Arc::clone(&client);
+                let pb = pb.clone();
+                let novel_arc = Arc::clone(&novel_arc);
+                let crawler = Arc::clone(&crawler_arc);
+                let abort = Arc::clone(&abort);
+                async move {
+                    if abort.load(Ordering::Relaxed) {
+                        pb.inc(1);
+                        return;
+                    }
+                    let chapter = {
+                        let n = novel_arc.lock().await;
+                        n.chapters[idx].clone()
+                    };
+                    let mut chapter = chapter;
+                    pb.set_message(format!("Ch.{:04}", chapter.id));
+                    match crawler.read_chapter(&client, &mut chapter).await {
+                        Ok(()) => {
+                            let mut n = novel_arc.lock().await;
+                            n.chapters[idx] = chapter;
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("did not return JSON") {
+                                abort.store(true, Ordering::Relaxed);
+                                pb.println(format!(
+                                    "  {} Non-JSON response — stopping.",
+                                    "error:".red().bold()
+                                ));
+                            } else {
+                                pb.println(format!(
+                                    "  {} chapter {}: {}",
+                                    "warn:".yellow(),
+                                    idx + 1,
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    pb.inc(1);
+                }
+            })
+            .buffer_unordered(max_workers)
+            .collect::<Vec<_>>()
+            .await;
+
+        pb.finish_with_message("done");
+
+        // Merge new chapters into existing novel
+        let fresh_novel = Arc::try_unwrap(novel_arc)
+            .expect("no other references")
+            .into_inner();
+
+        let new_chapters: Vec<&Chapter> = new_indices
+            .iter()
+            .map(|&i| &fresh_novel.chapters[i])
+            .filter(|c| c.body.is_some())
+            .collect();
+
+        if new_chapters.is_empty() {
+            println!("  {} No new chapters downloaded successfully.", "⚠".yellow());
+            continue;
+        }
+
+        // Merge: existing + new, sorted by id
+        let mut merged = existing_novel.clone();
+        merged.title = fresh_novel.title.clone();
+        merged.author = fresh_novel.author.clone();
+        merged.cover_url = fresh_novel.cover_url.clone();
+        merged.synopsis = fresh_novel.synopsis.clone();
+        merged.volumes = fresh_novel.volumes.clone();
+
+        let new_ids: std::collections::HashSet<usize> =
+            new_chapters.iter().map(|c| c.id).collect();
+        merged.chapters.retain(|c| !new_ids.contains(&c.id));
+        for c in &new_chapters {
+            merged.chapters.push((*c).clone());
+        }
+        merged.chapters.sort_by_key(|c| c.id);
+
+        // Determine output formats
+        let formats = if !args.format.is_empty() {
+            args.format
+                .iter()
+                .filter_map(|s| models::OutputFormat::from_str(s))
+                .collect()
+        } else if let Some(detected) = detect_existing_formats(out_dir) {
+            detected
+        } else {
+            vec![models::OutputFormat::Json]
+        };
+
+        let stem = build_filename(&merged);
+        output::rename_old_chapter_files(out_dir, &stem);
+        let all_chapters: Vec<&Chapter> =
+            merged.chapters.iter().filter(|c| c.body.is_some()).collect();
+        let created = write_outputs(&merged, &all_chapters, out_dir, &formats, &stem).await?;
+
+        println!(
+            "  {} {} new chapters merged → {} total. Files updated:",
+            "✓".green(),
+            new_chapters.len(),
+            all_chapters.len(),
+        );
+        for path in &created {
+            println!("    {}", path.display());
+        }
+        println!();
+    }
+
+    println!("{}", "Update complete.".green().bold());
+    Ok(())
 }
 
 // ── search ────────────────────────────────────────────────────────────────────

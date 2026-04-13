@@ -40,6 +40,9 @@ pub enum Commands {
 
     /// Search for novels across supported sources
     Search(SearchArgs),
+
+    /// Check existing novels for new chapters and download them
+    Update(UpdateArgs),
 }
 
 // ── Sources subcommand ───────────────────────────────────────────────────────
@@ -186,4 +189,24 @@ pub struct SearchArgs {
     /// Maximum results per source (default: 10)
     #[arg(short = 'l', long, default_value = "10", value_name = "N")]
     pub limit: usize,
+}
+
+// ── Update arguments ─────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+pub struct UpdateArgs {
+    /// Only update a specific novel (match by directory name or title substring)
+    pub filter: Option<String>,
+
+    /// Output formats (comma-separated: json, epub, txt). Default: keep existing
+    #[arg(short = 'f', long, value_name = "FORMAT", value_delimiter = ',')]
+    pub format: Vec<String>,
+
+    /// Maximum concurrent chapter downloads (default: 5)
+    #[arg(long, default_value = "5", value_name = "N")]
+    pub workers: usize,
+
+    /// Base directory containing novel folders (default: ./Lightnovels)
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
 }

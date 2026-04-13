@@ -11,16 +11,16 @@ path = "src/main.rs"
 anyhow          = "1"
 async-trait     = "0.1"
 clap            = { version = "4", features = ["derive"] }
-colored         = "2"
-dialoguer       = "0.11"
+colored         = "3"
+dialoguer       = "0.12"
 futures         = "0.3"
-indicatif       = "0.17"
+indicatif       = "0.18"
 regex           = "1"
 reqwest         = { version = "0.13", features = ["json", "cookies", "gzip", "form"] }
-scraper         = "0.19"
+scraper         = "0.26"
 spider          = { version = "2", default-features = false, features = ["cookies", "headers", "sync"] }
 serde           = { version = "1", features = ["derive"] }
 serde_json      = "1"
 tokio           = { version = "1", features = ["full"] }
 url             = "2"
-zip             = "2"
+zip             = "8"

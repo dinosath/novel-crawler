@@ -36,6 +36,7 @@ pub static SOURCES: &[SourceInfo] = &[
     SourceInfo::new("WebNovel",          "https://www.webnovel.com",           "en", true,  false),
     SourceInfo::new("NovelFull",         "https://novelfull.com",              "en", true,  false),
     SourceInfo::new("NovelBin",          "https://novelbin.com",               "en", true,  false),
+    SourceInfo::new("NovelishUniverse",  "https://novelishuniverse.com",       "en", true,  false),
     SourceInfo::new("NovelHulk",         "https://novelhulk.com",              "en", true,  false),
     SourceInfo::new("ReadNovelFull",     "https://readnovelfull.com",          "en", true,  false),
     SourceInfo::new("BoxNovel",          "https://boxnovel.com",               "en", true,  false),

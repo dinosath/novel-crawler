@@ -103,7 +103,7 @@ pub struct SearchResult {
 }
 
 /// Supported output formats.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OutputFormat {
     Json,
     Epub,

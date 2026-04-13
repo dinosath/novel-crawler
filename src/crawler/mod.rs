@@ -1,4 +1,5 @@
 pub mod brightnovels;
+pub mod novelishuniverse;
 pub mod novelfull;
 pub mod novelbin;
 pub mod royalroad;
@@ -78,6 +79,7 @@ pub fn create_crawler(url: &str) -> Option<Box<dyn Crawler>> {
         "scribblehub.com" => Some(Box::new(scribblehub::ScribbleHubCrawler::new())),
         "webnovel.com" | "m.webnovel.com" => Some(Box::new(webnovel::WebnovelCrawler::new())),
         "novelbin.com" | "novelbin.me" => Some(Box::new(novelbin::NovelBinCrawler::new())),
+        "novelishuniverse.com" => Some(Box::new(novelishuniverse::NovelishUniverseCrawler::new())),
         _ => None,
     }
 }
@@ -91,6 +93,7 @@ pub fn all_crawlers() -> Vec<Box<dyn Crawler>> {
         Box::new(scribblehub::ScribbleHubCrawler::new()),
         Box::new(webnovel::WebnovelCrawler::new()),
         Box::new(novelbin::NovelBinCrawler::new()),
+        Box::new(novelishuniverse::NovelishUniverseCrawler::new()),
     ]
 }
 
